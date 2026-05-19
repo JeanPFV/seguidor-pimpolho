@@ -1,5 +1,8 @@
 #include <Arduino.h>
 #include "BluetoothSerial.h"
+#include <string.h>
+#include <stdlib.h>
+#include <ctype.h>
 
 #if !defined(CONFIG_BT_ENABLED) || !defined(CONFIG_BLUEDROID_ENABLED)
 #error Bluetooth is not enabled!
@@ -8,20 +11,39 @@
 BluetoothSerial SerialBT;
 
 // ================= PINAGEM =================
-const int frontalPins[8] = {26, 25, 33, 32, 35, 34, 39, 36}; 
-const int sensorEsq = 27;  
-const int sensorDir = 14;  
+// S0 e S1 (26, 25) são digitais. S2 a S7 são analógicos.
+const int frontalPins[8] = {26, 25, 33, 32, 35, 34, 39, 36};
 
-const int PWMA = 18, AIN1 = 22, AIN2 = 23; 
-const int PWMB = 19, BIN1 = 15, BIN2 = 2;  
-const int STBY = 21; 
+const int sensorEsq = 27;
+const int sensorDir = 14;
 
-const int botaoBoot = 13;
+// Ponte H
+const int PWMA = 18;
+const int AIN1 = 22;
+const int AIN2 = 23;
+
+const int PWMB = 19;
+const int BIN1 = 16;
+const int BIN2 = 17;
+
+const int STBY = 21;
+const int botaoBoot = 0;
+
+// ================= PWM LEDC =================
+const int freqPWM = 1000;
+const int resolucaoPWM = 8;
 
 // ================= PID =================
-float Kp = 15.0, Ki = 0.1, Kd = 8.0, lastError = 0, integral = 0;
-int maxSpeed = 200;
-int baseSpeed = 180;
+float Kp = 15.0;
+float Ki = 0.0;
+float Kd = 8.0;
+
+float lastError = 0.0;
+float integral = 0.0;
+float ultimoErroValido = 0.0;
+
+int maxSpeed = 150;
+int baseSpeed = 100;
 
 // ================= CALIBRAÇÃO =================
 int minValues[8] = {4095,4095,4095,4095,4095,4095,4095,4095};
@@ -30,168 +52,373 @@ int maxValues[8] = {0,0,0,0,0,0,0,0};
 // ================= ESTADO =================
 enum EstadoRobo { AGUARD_CALIB, CALIBRANDO, AGUARD_LARG, CORRENDO, PARADO };
 EstadoRobo estadoAtual = AGUARD_CALIB;
-bool telemetriaAtiva = false;
 
+bool telemetriaAtiva = false;
 int voltas = 0;
 unsigned long tempoTravaEsq = 0;
-String btBuffer = "";
+unsigned long ultimoEnvioTelemetria = 0;
+unsigned long ultimoDebounceBoot = 0;
+
+// ================= BUFFER BT =================
+char btBuffer[24];
+uint8_t btIndex = 0;
+
+// ================= FUNÇÕES AUXILIARES =================
+int lerSensor(int i) {
+  if (i == 0 || i == 1) {
+    return digitalRead(frontalPins[i]) ? 4095 : 0;
+  }
+  return analogRead(frontalPins[i]);
+}
+
+int normalizarLeitura(int raw, int minV, int maxV) {
+  if (maxV <= minV) return 0;
+
+  long valor = map(raw, minV, maxV, 1000, 0);
+  valor = constrain(valor, 0, 1000);
+  return (int)valor;
+}
+
+void resetarControle() {
+  lastError = 0.0;
+  integral = 0.0;
+  ultimoErroValido = 0.0;
+}
+
+void pararMotores() {
+  ledcWrite(PWMA, 0);
+  ledcWrite(PWMB, 0);
+
+  digitalWrite(AIN1, LOW);
+  digitalWrite(AIN2, LOW);
+  digitalWrite(BIN1, LOW);
+  digitalWrite(BIN2, LOW);
+}
+
+void mostrarParametros() {
+  SerialBT.printf("P=%.3f I=%.3f D=%.3f V=%d M=%d Estado=%d Voltas=%d\n",
+                  Kp, Ki, Kd, baseSpeed, maxSpeed, estadoAtual, voltas);
+}
 
 // ================= SETUP =================
 void setup() {
   Serial.begin(115200);
-  
-  analogSetAttenuation(ADC_11db);
-  
-  for(int i=0; i<8; i++) pinMode(frontalPins[i], INPUT);
-  pinMode(sensorEsq, INPUT); pinMode(sensorDir, INPUT);
-  
-  pinMode(AIN1,OUTPUT); pinMode(AIN2,OUTPUT); pinMode(PWMA,OUTPUT);
-  pinMode(BIN1,OUTPUT); pinMode(BIN2,OUTPUT); pinMode(PWMB,OUTPUT);
-  pinMode(STBY,OUTPUT); digitalWrite(STBY, HIGH);
+  SerialBT.begin("PIMPOLHO_FINAL");
+
+  for (int i = 0; i < 8; i++) pinMode(frontalPins[i], INPUT);
+
+  pinMode(sensorEsq, INPUT_PULLUP);
+  pinMode(sensorDir, INPUT_PULLUP);
+
+  pinMode(AIN1, OUTPUT);
+  pinMode(AIN2, OUTPUT);
+  pinMode(PWMA, OUTPUT);
+
+  pinMode(BIN1, OUTPUT);
+  pinMode(BIN2, OUTPUT);
+  pinMode(PWMB, OUTPUT);
+
+  pinMode(STBY, OUTPUT);
+  digitalWrite(STBY, HIGH);
 
   pinMode(botaoBoot, INPUT_PULLUP);
 
-  SerialBT.println("C=Calibrar  S=Start/Stop");
-  SerialBT.println("L=Telemetria  ?=Status");
-  Serial.println("SEM ENCODER!");
+  ledcAttach(PWMA, freqPWM, resolucaoPWM);
+  ledcAttach(PWMB, freqPWM, resolucaoPWM);
+
+  pararMotores();
+  resetarControle();
+
+  btBuffer[0] = '\0';
+
+  SerialBT.println("=== PIMPOLHO COMPETICAO ===");
+  SerialBT.println("C=Calibrar | S=Start/Stop | L=Telemetria | ?=Status");
+  SerialBT.println("P=15.0 | I=0.00 | D=8.0 | V=100 | M=150 | RST");
+  mostrarParametros();
 }
 
-// ================= FUNÇÕES =================
-float lerSensor(int i) {
-  return (i<2) ? (digitalRead(frontalPins[i]) ? 4095 : 0) : analogRead(frontalPins[i]);
-}
-
+// ================= CONTROLE =================
 void calibrarSensores() {
-  SerialBT.println("CALIBRANDO 5s...");
-  for(int i=0; i<8; i++) { minValues[i]=4095; maxValues[i]=0; }
-  
+  SerialBT.println("CALIBRANDO 5s... Mova na pista!");
+
+  for (int i = 0; i < 8; i++) {
+    minValues[i] = 4095;
+    maxValues[i] = 0;
+  }
+
   unsigned long t0 = millis();
-  while(millis()-t0 < 5000) {
-    for(int i=0; i<8; i++) {
+  while (millis() - t0 < 5000) {
+    for (int i = 0; i < 8; i++) {
       int v = lerSensor(i);
       minValues[i] = min(minValues[i], v);
       maxValues[i] = max(maxValues[i], v);
     }
     delay(5);
   }
-  SerialBT.println("CALIB OK!");
+
+  resetarControle();
+  telemetriaAtiva = false;
+
+  SerialBT.println("CALIB OK! Envie 'S' para largar.");
 }
 
 void motores(int esq, int dir) {
-  esq = constrain(esq, 0, maxSpeed);
-  dir = constrain(dir, 0, maxSpeed);
-  
-  digitalWrite(AIN1, LOW);  digitalWrite(AIN2, HIGH); analogWrite(PWMA, esq);
-  digitalWrite(BIN1, LOW);  digitalWrite(BIN2, HIGH); analogWrite(PWMB, dir);
+  esq = constrain(esq, -maxSpeed, maxSpeed);
+  dir = constrain(dir, -maxSpeed, maxSpeed);
+
+  if (esq >= 0) {
+    digitalWrite(AIN1, LOW);
+    digitalWrite(AIN2, HIGH);
+    ledcWrite(PWMA, esq);
+  } else {
+    digitalWrite(AIN1, HIGH);
+    digitalWrite(AIN2, LOW);
+    ledcWrite(PWMA, -esq);
+  }
+
+  if (dir >= 0) {
+    digitalWrite(BIN1, LOW);
+    digitalWrite(BIN2, HIGH);
+    ledcWrite(PWMB, dir);
+  } else {
+    digitalWrite(BIN1, HIGH);
+    digitalWrite(BIN2, LOW);
+    ledcWrite(PWMB, -dir);
+  }
 }
 
 float erroLinha() {
-  float p[8] = {-3.5,-2.5,-1.5,-0.5,0.5,1.5,2.5,3.5};
-  float sp=0, sl=0;
-  
-  for(int i=0; i<8; i++) {
+  const float p[8] = {-3.5,-2.5,-1.5,-0.5,0.5,1.5,2.5,3.5};
+  float somaPesada = 0.0;
+  float somaLeituras = 0.0;
+
+  for (int i = 0; i < 8; i++) {
     int raw = lerSensor(i);
-    int n = map(raw, minValues[i], maxValues[i], 1000, 0);
-    n = constrain(n, 0, 1000);
-    if(n > 250) { sp += n*p[i]; sl += n; }
+    int n = normalizarLeitura(raw, minValues[i], maxValues[i]);
+
+    if (n > 300) {
+      somaPesada += n * p[i];
+      somaLeituras += n;
+    }
   }
-  return sl ? sp/sl : lastError;
+
+  if (somaLeituras > 0.0) {
+    ultimoErroValido = somaPesada / somaLeituras;
+    return ultimoErroValido;
+  }
+
+  return ultimoErroValido;
 }
 
 float PID(float erro) {
   float prop = Kp * erro;
-  integral += erro * Ki; integral = constrain(integral, -50, 50);
+
+  integral += erro;
+  integral = constrain(integral, -50.0, 50.0);
+  float integ = Ki * integral;
+
   float der = Kd * (erro - lastError);
   lastError = erro;
-  return prop + integral + deriv;
+
+  return prop + integ + der;
 }
 
 void laterais() {
-  if(digitalRead(sensorEsq) && millis()-tempoTravaEsq > 500) {
-    voltas++; 
+  if (digitalRead(sensorEsq) == LOW && (millis() - tempoTravaEsq > 500)) {
+    voltas++;
     tempoTravaEsq = millis();
-    SerialBT.print("Volta "); SerialBT.println(voltas);
+    SerialBT.print("Volta ");
+    SerialBT.println(voltas);
   }
 }
 
+void enviarTelemetriaSensores() {
+  SerialBT.print("Sensores: ");
+  for (int i = 0; i < 8; i++) {
+    int n = normalizarLeitura(lerSensor(i), minValues[i], maxValues[i]);
+    SerialBT.print(n);
+    if (i < 7) SerialBT.print(" ");
+  }
+  SerialBT.println();
+}
+
+// ================= PARSER BT =================
+bool parseFloatCmd(const char* cmd, char prefixo, float* destino) {
+  if (cmd[0] == prefixo && cmd[1] == '=') {
+    *destino = atof(cmd + 2);
+    return true;
+  }
+  return false;
+}
+
+bool parseIntCmd(const char* cmd, char prefixo, int* destino) {
+  if (cmd[0] == prefixo && cmd[1] == '=') {
+    *destino = atoi(cmd + 2);
+    return true;
+  }
+  return false;
+}
+
+void executarComandoBT(const char* cmd) {
+  float ftmp;
+  int itmp;
+
+  if (strcmp(cmd, "C") == 0) {
+    estadoAtual = CALIBRANDO;
+    SerialBT.println("OK CALIB");
+    return;
+  }
+
+  if (strcmp(cmd, "S") == 0) {
+    if (estadoAtual == AGUARD_LARG) {
+      resetarControle();
+      estadoAtual = CORRENDO;
+      SerialBT.println("LARGADA!");
+    } else if (estadoAtual == CORRENDO) {
+      estadoAtual = PARADO;
+      SerialBT.println("PARADO");
+    }
+    return;
+  }
+
+  if (strcmp(cmd, "L") == 0) {
+    telemetriaAtiva = !telemetriaAtiva;
+    SerialBT.println(telemetriaAtiva ? "TELE ON" : "TELE OFF");
+    return;
+  }
+
+  if (strcmp(cmd, "?") == 0) {
+    mostrarParametros();
+    return;
+  }
+
+  if (strcmp(cmd, "RST") == 0) {
+    resetarControle();
+    SerialBT.println("PID RESET");
+    return;
+  }
+
+  if (parseFloatCmd(cmd, 'P', &ftmp)) {
+    Kp = ftmp;
+    SerialBT.printf("OK P=%.3f\n", Kp);
+    return;
+  }
+
+  if (parseFloatCmd(cmd, 'I', &ftmp)) {
+    Ki = ftmp;
+    SerialBT.printf("OK I=%.3f\n", Ki);
+    return;
+  }
+
+  if (parseFloatCmd(cmd, 'D', &ftmp)) {
+    Kd = ftmp;
+    SerialBT.printf("OK D=%.3f\n", Kd);
+    return;
+  }
+
+  if (parseIntCmd(cmd, 'V', &itmp)) {
+    baseSpeed = constrain(itmp, 0, 255);
+    SerialBT.printf("OK V=%d\n", baseSpeed);
+    return;
+  }
+
+  if (parseIntCmd(cmd, 'M', &itmp)) {
+    maxSpeed = constrain(itmp, 0, 255);
+    SerialBT.printf("OK M=%d\n", maxSpeed);
+    return;
+  }
+
+  SerialBT.print("CMD INVALIDO: ");
+  SerialBT.println(cmd);
+}
+
 void checarBT() {
-  while(SerialBT.available()) {
+  while (SerialBT.available()) {
     char c = SerialBT.read();
-    if(c == '\n' || c == '\r') {
-      if(btBuffer.length() > 0) {
-        btBuffer.toUpperCase();
-        Serial.print("CMD: "); Serial.println(btBuffer);
-        
-        if(btBuffer == "C") { 
-          estadoAtual = CALIBRANDO; 
-          SerialBT.println("CALIBRANDO...");
+
+    if (c == '\n' || c == '\r') {
+      if (btIndex > 0) {
+        btBuffer[btIndex] = '\0';
+
+        for (uint8_t i = 0; i < btIndex; i++) {
+          btBuffer[i] = toupper((unsigned char)btBuffer[i]);
         }
-        else if(btBuffer == "S") {
-          if(estadoAtual == AGUARD_LARG) { 
-            SerialBT.println("🚀 LARGADA!"); 
-            estadoAtual = CORRENDO; 
-          } else { 
-            estadoAtual = PARADO; 
-            SerialBT.println("🛑 PARADO");
-          }
-        }
-        else if(btBuffer == "L") { 
-          telemetriaAtiva = !telemetriaAtiva; 
-          SerialBT.println(telemetriaAtiva ? "TELE ON" : "TELE OFF"); 
-        }
-        else if(btBuffer == "?") {
-          SerialBT.printf("Kp=%.1f Kd=%.1f V=%d\n", Kp, Kd, baseSpeed);
-        }
-        btBuffer = "";
+
+        executarComandoBT(btBuffer);
+
+        btIndex = 0;
+        btBuffer[0] = '\0';
       }
-    } else if(btBuffer.length() < 10) {
-      btBuffer += c;
+    } else {
+      if (btIndex < sizeof(btBuffer) - 1) {
+        btBuffer[btIndex++] = c;
+      }
     }
   }
 }
 
+bool botaoBootPressionado() {
+  if (digitalRead(botaoBoot) == LOW) {
+    if (millis() - ultimoDebounceBoot > 300) {
+      ultimoDebounceBoot = millis();
+      return true;
+    }
+  }
+  return false;
+}
+
 // ================= LOOP =================
 void loop() {
+  unsigned long agora = millis();
+
   checarBT();
-  
-  if(digitalRead(botaoBoot) == LOW) {
-    estadoAtual = CALIBRANDO;
-    delay(300);
+
+  if (botaoBootPressionado()) {
+    if (estadoAtual == AGUARD_CALIB || estadoAtual == PARADO || estadoAtual == AGUARD_LARG) {
+      estadoAtual = CALIBRANDO;
+    } else if (estadoAtual == CORRENDO) {
+      estadoAtual = PARADO;
+    }
   }
-  
-  switch(estadoAtual) {
+
+  switch (estadoAtual) {
     case CALIBRANDO:
+      pararMotores();
       calibrarSensores();
       estadoAtual = AGUARD_LARG;
-      SerialBT.println("CALIBRADO! Envie S");
       break;
-      
+
     case AGUARD_CALIB:
-      SerialBT.println("Envie C");
-      delay(1000);
+      pararMotores();
       break;
-      
+
     case AGUARD_LARG:
-      motores(0,0);
-      if(telemetriaAtiva) {
-        SerialBT.printf("Aguardando...\n");
-        delay(1000);
+      pararMotores();
+      if (telemetriaAtiva && (agora - ultimoEnvioTelemetria >= 200)) {
+        ultimoEnvioTelemetria = agora;
+        enviarTelemetriaSensores();
       }
       break;
-      
+
     case PARADO:
-      motores(0,0);
-      delay(500);
+      pararMotores();
+      telemetriaAtiva = false;
       break;
-      
-    case CORRENDO:
+
+    case CORRENDO: {
+      telemetriaAtiva = false;
       laterais();
-      
+
       float e = erroLinha();
       float correcao = PID(e);
-      motores(baseSpeed + correcao, baseSpeed - correcao);
+
+      int velEsq = (int)(baseSpeed + correcao);
+      int velDir = (int)(baseSpeed - correcao);
+
+      motores(velEsq, velDir);
       break;
+    }
   }
-  
+
   delay(3);
 }
