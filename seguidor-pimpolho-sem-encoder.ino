@@ -11,7 +11,7 @@
 BluetoothSerial SerialBT;
 
 // ================= PINAGEM =================
-const int frontalPins[8] = { 26, 36, 33, 32, 35, 34, 39, 25 };
+const int frontalPins[8] = {26, 36, 33, 32, 35, 34, 39, 25};
 
 const int sensorEsq = 27;
 const int sensorDir = 14;
@@ -33,28 +33,33 @@ const int freqPWM = 1000;
 const int resolucaoPWM = 8;
 
 // ================= PID =================
-float Kp = 38.0;
+float Kp = 40.0;
 float Ki = 0.0;
-float Kd = 13.0;
-
+float Kd = 20.0;
 
 float lastError = 0.0;
 float integral = 0.0;
 float ultimoErroValido = 0.0;
 
-int maxSpeed = 150;
-int baseSpeed = 100;
+int maxSpeed = 200;
+int baseSpeed = 140;
+
+// ================= AUMENTO DE VELOCIDADE NA MARCA 14 =================
+int baseSpeedNormal = 140;
+int baseSpeedAposMarca14 = 170;
 
 // ================= CALIBRAÇÃO =================
-int minValues[8] = { 4095, 4095, 4095, 4095, 4095, 4095, 4095, 4095 };
-int maxValues[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+int minValues[8] = {4095, 4095, 4095, 4095, 4095, 4095, 4095, 4095};
+int maxValues[8] = {0, 0, 0, 0, 0, 0, 0, 0};
 
 // ================= ESTADO =================
-enum EstadoRobo { AGUARD_CALIB,
-                  CALIBRANDO,
-                  AGUARD_LARG,
-                  CORRENDO,
-                  PARADO };
+enum EstadoRobo {
+  AGUARD_CALIB,
+  CALIBRANDO,
+  AGUARD_LARG,
+  CORRENDO,
+  PARADO
+};
 EstadoRobo estadoAtual = AGUARD_CALIB;
 
 bool telemetriaAtiva = false;
@@ -63,7 +68,13 @@ unsigned long tempoTravaEsq = 0;
 unsigned long ultimoEnvioTelemetria = 0;
 unsigned long ultimoDebounceBoot = 0;
 
-// NOVO: controle da volta pelo sensor direito
+// ================= SENSOR ESQUERDO =================
+int contadorEsq = 0;
+bool sensorEsqEmMarca = false;
+unsigned long tempoTravaMarcaEsq = 0;
+const unsigned long debounceMarcaEsq = 120;
+
+// ================= CONTROLE DA VOLTA PELO SENSOR DIREITO =================
 int contagemDireita = 0;
 bool sensorDirEmLinha = false;
 unsigned long tempoTravaDir = 0;
@@ -71,11 +82,10 @@ const unsigned long debounceDir = 300;
 
 int contagemMarcas = 0;
 unsigned long tempoInicioCorrida = 0;
-const unsigned long tempoMinimoChegada = 1;  // ajuste conforme a pista
+const unsigned long tempoMinimoChegada = 1;
 
 const int totalPontosBrancos = 28;
-const int toleranciaPontos = 1;
-
+const int toleranciaPontos = 0;
 
 // ================= BUFFER BT =================
 char btBuffer[24];
@@ -113,9 +123,17 @@ void pararMotores() {
   digitalWrite(BIN2, LOW);
 }
 
+void atualizarVelocidadePorMarcacaoEsq() {
+  if (contadorEsq >= 14 && contadorEsq < 17) {
+    baseSpeed = baseSpeedAposMarca14;
+  } else {
+    baseSpeed = baseSpeedNormal;
+  }
+}
+
 void mostrarParametros() {
-  SerialBT.printf("P=%.3f I=%.3f D=%.3f V=%d M=%d Estado=%d Voltas=%d\n",
-                  Kp, Ki, Kd, baseSpeed, maxSpeed, estadoAtual, voltas);
+  SerialBT.printf("P=%.3f I=%.3f D=%.3f V=%d M=%d Estado=%d Voltas=%d CntEsq=%d\n",
+                  Kp, Ki, Kd, baseSpeed, maxSpeed, estadoAtual, voltas, contadorEsq);
 }
 
 // ================= SETUP =================
@@ -146,6 +164,7 @@ void setup() {
 
   pararMotores();
   resetarControle();
+  atualizarVelocidadePorMarcacaoEsq();
 
   btBuffer[0] = '\0';
 
@@ -156,7 +175,6 @@ void setup() {
 }
 
 // ================= CONTROLE =================
-
 void enviarTelemetriaSensores() {
   SerialBT.print("Sensores: ");
 
@@ -168,6 +186,10 @@ void enviarTelemetriaSensores() {
     if (i < 7) SerialBT.print(" ");
   }
 
+  SerialBT.print(" | ESQ=");
+  SerialBT.print(digitalRead(sensorEsq));
+  SerialBT.print(" | CNTESQ=");
+  SerialBT.print(contadorEsq);
   SerialBT.print(" | DIR=");
   SerialBT.println(digitalRead(sensorDir));
 }
@@ -198,6 +220,11 @@ void calibrarSensores() {
   sensorDirEmLinha = false;
   tempoTravaDir = 0;
   tempoInicioCorrida = 0;
+
+  contadorEsq = 0;
+  sensorEsqEmMarca = false;
+  tempoTravaMarcaEsq = 0;
+  atualizarVelocidadePorMarcacaoEsq();
 
   SerialBT.println("CALIB OK! Envie 'S' para largar.");
 }
@@ -232,8 +259,21 @@ float erroLinha() {
   float somaPesada = 0.0;
   float somaLeituras = 0.0;
 
-  for (int i = 0; i < 8; i++) {
-    int raw = lerSensor(i);
+  bool extEsq = (digitalRead(frontalPins[0]) == LOW);
+  bool extDir = (digitalRead(frontalPins[7]) == LOW);
+
+  if (extEsq) {
+    somaPesada += 1000 * p[0];
+    somaLeituras += 1000;
+  }
+
+  if (extDir) {
+    somaPesada += 1000 * p[7];
+    somaLeituras += 1000;
+  }
+
+  for (int i = 1; i <= 6; i++) {
+    int raw = analogRead(frontalPins[i]);
     int n = normalizarLeitura(raw, minValues[i], maxValues[i]);
 
     if (n > 150) {
@@ -250,11 +290,11 @@ float erroLinha() {
   return ultimoErroValido;
 }
 
-float PID(float erro) {
+float PID(float erro, float baseSpeedPID) {
   float prop = Kp * erro;
 
   integral += erro;
-  integral = constrain(integral, -50.0, 50.0);
+  integral = constrain(integral, -baseSpeedPID, baseSpeedPID);
   float integ = Ki * integral;
 
   float der = Kd * (erro - lastError);
@@ -283,6 +323,27 @@ bool frontaisIndicamInterseccao() {
   return (ativosTotal >= 5 && ativosCentro >= 3 && soma >= 3200);
 }
 
+void verificarMarcacaoSensorEsquerdo() {
+  unsigned long agora = millis();
+
+  // Ajuste esta lógica se o seu sensor inverter o nível ativo
+  bool marcouAgora = (digitalRead(sensorEsq) == LOW);
+
+  if (marcouAgora && !sensorEsqEmMarca && (agora - tempoTravaMarcaEsq > debounceMarcaEsq)) {
+    sensorEsqEmMarca = true;
+    tempoTravaMarcaEsq = agora;
+
+    contadorEsq++;
+    atualizarVelocidadePorMarcacaoEsq();
+
+    SerialBT.printf("MARCACAO ESQ: %d | V=%d\n", contadorEsq, baseSpeed);
+  }
+
+  if (!marcouAgora) {
+    sensorEsqEmMarca = false;
+  }
+}
+
 void verificarVoltaSensorDireito() {
   unsigned long agora = millis();
   bool brancoAgora = (digitalRead(sensorDir) == LOW);
@@ -298,6 +359,7 @@ void verificarVoltaSensorDireito() {
         (agora - tempoInicioCorrida) >= tempoMinimoChegada &&
         contagemMarcas >= totalPontosBrancos) {
       SerialBT.println("CHEGADA VALIDADA - PARANDO");
+      delay(1000);
       estadoAtual = PARADO;
     }
   }
@@ -327,7 +389,6 @@ bool pareceInterseccao() {
   return (ativosTotal >= 5 && ativosCentro >= 3 && soma >= 3200);
 }
 
-
 int contInterseccao = 0;
 
 bool pareceInterseccaoFiltrada() {
@@ -336,8 +397,6 @@ bool pareceInterseccaoFiltrada() {
 
   return (contInterseccao >= 2);
 }
-
-
 
 // ================= PARSER BT =================
 bool parseFloatCmd(const char* cmd, char prefixo, float* destino) {
@@ -374,6 +433,12 @@ void executarComandoBT(const char* cmd) {
       sensorDirEmLinha = false;
       tempoTravaDir = 0;
       tempoInicioCorrida = millis();
+
+      contadorEsq = 0;
+      sensorEsqEmMarca = false;
+      tempoTravaMarcaEsq = 0;
+      atualizarVelocidadePorMarcacaoEsq();
+
       estadoAtual = CORRENDO;
       SerialBT.println("LARGADA!");
     } else if (estadoAtual == CORRENDO) {
@@ -396,6 +461,10 @@ void executarComandoBT(const char* cmd) {
 
   if (strcmp(cmd, "RST") == 0) {
     resetarControle();
+    contadorEsq = 0;
+    sensorEsqEmMarca = false;
+    tempoTravaMarcaEsq = 0;
+    atualizarVelocidadePorMarcacaoEsq();
     SerialBT.println("PID RESET");
     return;
   }
@@ -419,8 +488,9 @@ void executarComandoBT(const char* cmd) {
   }
 
   if (parseIntCmd(cmd, 'V', &itmp)) {
-    baseSpeed = constrain(itmp, 0, 255);
-    SerialBT.printf("OK V=%d\n", baseSpeed);
+    baseSpeedNormal = constrain(itmp, 0, 255);
+    atualizarVelocidadePorMarcacaoEsq();
+    SerialBT.printf("OK V=%d\n", baseSpeedNormal);
     return;
   }
 
@@ -507,27 +577,27 @@ void loop() {
       telemetriaAtiva = false;
       break;
 
-    case CORRENDO:
-      {
-        telemetriaAtiva = false;
+    case CORRENDO: {
+      telemetriaAtiva = false;
 
-        verificarVoltaSensorDireito();
+      verificarMarcacaoSensorEsquerdo();
+      verificarVoltaSensorDireito();
 
-        if (estadoAtual == PARADO) {
-          pararMotores();
-          break;
-        }
-
-        float e = erroLinha();
-        float correcao = PID(e);
-        correcao = constrain(correcao, -50, 50);
-
-        int velEsq = (int)(baseSpeed - correcao);
-        int velDir = (int)(baseSpeed + correcao);
-
-        motores(velEsq, velDir);
+      if (estadoAtual == PARADO) {
+        pararMotores();
         break;
       }
+
+      float e = erroLinha();
+      float correcao = PID(e, baseSpeed);
+      correcao = constrain(correcao, -maxSpeed, maxSpeed);
+
+      int velEsq = (int)(baseSpeed - correcao);
+      int velDir = (int)(baseSpeed + correcao);
+
+      motores(velEsq, velDir);
+      break;
+    }
   }
 
   delay(3);
